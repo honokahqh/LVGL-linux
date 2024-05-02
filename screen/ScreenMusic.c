@@ -72,6 +72,10 @@ void ui_event_MusicChange( lv_event_t * e) {
         if(btn == MusicState.Btn[i])
         {
             MusicState.index = i;
+            char file_path[256];
+            snprintf(file_path, sizeof(file_path), "%s%s", AudioResourcePath, lv_label_get_text(MusicState.Label[i]));
+            audio_mp3Init(file_path);
+            MusicState.isPlay = 1;
         }
     }
     for(int i = 0;i < sizeof(btns) / sizeof(btns[0]);i++)
@@ -107,16 +111,6 @@ void ui_event_MusicChange( lv_event_t * e) {
                 break;
             case 3: // play/pause
                 MusicState.isPlay = (MusicState.isPlay + 1) % 2;
-                if(MusicState.isPlay)
-                {
-                    lv_label_set_text(ui_MusicLabelStart,"停");
-                    LOG_I(TAG, "music pause\n");
-                }             
-                else
-                {
-                    lv_label_set_text(ui_MusicLabelStart,"播");
-                    LOG_I(TAG, "music start\n");
-                }
                 break;
             case 4:
                 MusicState.isRandomLoop = (MusicState.isRandomLoop + 1) % 2;
@@ -129,6 +123,17 @@ void ui_event_MusicChange( lv_event_t * e) {
                 break;
             }
         }
+    }
+    audio_mp3SetPlayState(MusicState.isPlay);
+    if(!MusicState.isPlay)
+    {
+        lv_label_set_text(ui_MusicLabelStart,"播");
+        LOG_I(TAG, "music start\n");
+    }             
+    else
+    {
+        lv_label_set_text(ui_MusicLabelStart,"停");
+        LOG_I(TAG, "music pause\n");
     }
     lv_obj_set_style_bg_opa(MusicState.Btn[MusicState.index], 255, LV_PART_MAIN| LV_STATE_DEFAULT);
     lv_label_set_text(ui_MusicLabelMusicNow, lv_label_get_text(MusicState.Label[MusicState.index]));

@@ -1,64 +1,120 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <string.h>
-#include <pthread.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include "mi_common_datatype.h"
-#include "mi_sys.h"
-#include "mi_ao.h"
+/*  !!!没开线程锁,需要保证顺序执行!!!   */
 #include "audio.h"
-#include "log.h"
+#include "libmad_driver.h"
 
 #define TAG "audio driver"
 
 #define WAV_HEADER_SIZE 44
-#define SAMPLE_PER_FRAME 1024
+#define SAMPLE_PER_FRAME 2304
+#define MAX_FRAMES      20
+#define AO_DEV_LINE_OUT         (0)
+#define AO_DEV_I2S_TX           (1)
 
 typedef struct {
     MI_AUDIO_DEV aoDevId;
     MI_AO_CHN aoChn;
     char *FilePath;
-    volatile int hasNewAudio;
+    volatile int hasNewAudio; // 1:有新的音频需要播放
+    volatile int mp3PlayState; // 0:停止 1:播放 2:暂停
 } AudioThreadaudio;
-
 AudioThreadaudio audio;
 
-static void setup_gpio(int gpio, const char *direction, int value);
+typedef struct{
+    short buf[SAMPLE_PER_FRAME];
+    int length;
+    int frq;
+    int channels;
+}mp3Frame_t;
+
+typedef struct{
+    mp3Frame_t frame[MAX_FRAMES];
+    uint8_t Head;
+    uint8_t Tail;
+    uint8_t Num;    
+    uint8_t hasNewMP3;
+    uint8_t playState;
+    char *FilePath;
+}AudioMP3State_t;
+AudioMP3State_t AudioMP3State;
+
+static void mp3Decoder();
+static int mp3_frameDataProcess(uint16_t *data, int length, int frq, int channels);
+static int mp3_frameDataRead(uint8_t *data, int *length, int *frq, int *channels);
 
 void* audioPlayThread(void *arg) {
     AudioThreadaudio *audio = (AudioThreadaudio *)arg;
+    MI_AUDIO_Frame_t frame;
+    frame.apVirAddr[0] = malloc(SAMPLE_PER_FRAME * 2);
+    int errCount;
+    int fd = -1; // 初始化 fd 为无效值
+    int lastsampleRate = E_MI_AUDIO_SAMPLE_RATE_44100, sampleRate = E_MI_AUDIO_SAMPLE_RATE_44100;
+    int lastchannel = 2, channels = 2;
 
     while (1) {
-        usleep(10000);  // 间隔一段时间检查是否有新音频
         if (audio->hasNewAudio) {
-            audio->hasNewAudio = 0;
-            int fd = open(audio->FilePath, O_RDONLY);
+            audio->hasNewAudio = 0;  // 重置标志位
+            if (fd > 0) // 上一次音频播放还未结束,被打断
+            close(fd);
+            fd = open(audio->FilePath, O_RDONLY);
             if (fd < 0) {
                 LOG_E(TAG, "Failed to open audio file");
+                continue; // 跳过当前迭代
             }
-            else
-            {
-                lseek(fd, WAV_HEADER_SIZE, SEEK_SET);
-                MI_AUDIO_Frame_t frame;
-                frame.u32Len = SAMPLE_PER_FRAME;
-                frame.apVirAddr[0] = malloc(SAMPLE_PER_FRAME);
-                ssize_t bytesRead;
+            lseek(fd, WAV_HEADER_SIZE, SEEK_SET);
+        }
+        if (fd >= 0) { // 检查 fd 是否有效
+            frame.u32Len = SAMPLE_PER_FRAME;
+            ssize_t bytesRead;
 
-                while ((bytesRead = read(fd, frame.apVirAddr[0], frame.u32Len)) > 0 && (!audio->hasNewAudio)) {
-                    if (MI_AO_SendFrame(audio->aoDevId, audio->aoChn, &frame, 0) != MI_SUCCESS) {
-                        usleep(1000); 
-                    }
+            if ((bytesRead = read(fd, frame.apVirAddr[0], frame.u32Len)) > 0) {
+                frame.u32Len = bytesRead;
+                errCount = 0;
+                while (MI_AO_SendFrame(audio->aoDevId, audio->aoChn, &frame, 0) != MI_SUCCESS) {
+                    usleep(1000 * 10); 
+                    errCount++;
+                    if(errCount > 10)
+                        break;
                 }
-
-                free(frame.apVirAddr[0]);
+                if(errCount > 10) {
+                    LOG_E(TAG, "MI_AO_SendFrame failed\n");
+                    // 处理错误，如重置逻辑或尝试恢复
+                }
+            }
+            else { // 文件读完,close
                 close(fd);
+                fd = -1;
             }
         }
+        else if(AudioMP3State.playState && mp3_frameDataRead(frame.apVirAddr[0], &frame.u32Len, &sampleRate, &channels)){
+            if(sampleRate != lastsampleRate || channels != lastchannel)
+            {
+                LOG_I(TAG, "audio parameter changed, frq:%d, channles:%d\n", sampleRate, channels);
+                MI_AUDIO_Attr_t aoAttr = {
+                    .eBitwidth = E_MI_AUDIO_BIT_WIDTH_16,
+                    .eSamplerate = sampleRate,
+                    .eSoundmode = E_MI_AUDIO_SOUND_MODE_STEREO,
+                    .eWorkmode = E_MI_AUDIO_MODE_I2S_MASTER,
+                    .u32ChnCnt = channels,
+                    .u32PtNumPerFrm = SAMPLE_PER_FRAME
+                };
+                MI_AO_SetPubAttr(audio->aoDevId, &aoAttr);
+                lastsampleRate = sampleRate;
+                lastchannel = channels;
+            }
+            errCount = 0;
+            while (MI_AO_SendFrame(audio->aoDevId, audio->aoChn, &frame, 0) != MI_SUCCESS) {
+                usleep(1000); 
+                errCount++;
+                if(errCount > 10) {
+                    LOG_E(TAG, "MI_AO_SendFrame failed\n");
+                    // 处理错误，如重置逻辑或尝试恢复
+                }
+            }
+        }   
+        else{
+            usleep(10 * 1000); // 10ms
+        }
     }
-
     return NULL;
 }
 
@@ -66,14 +122,14 @@ void speaker_init() {
 
     MI_AUDIO_Attr_t aoAttr = {
         .eBitwidth = E_MI_AUDIO_BIT_WIDTH_16,
-        .eSamplerate = E_MI_AUDIO_SAMPLE_RATE_48000,
+        .eSamplerate = E_MI_AUDIO_SAMPLE_RATE_44100,
         .eSoundmode = E_MI_AUDIO_SOUND_MODE_STEREO,
         .eWorkmode = E_MI_AUDIO_MODE_I2S_MASTER,
         .u32ChnCnt = 2,
         .u32PtNumPerFrm = SAMPLE_PER_FRAME
     };
     
-    audio.aoDevId = 0;
+    audio.aoDevId = AO_DEV_LINE_OUT;
     audio.aoChn = 0;
     audio.FilePath = strdup(WAV_Init);  
     audio.hasNewAudio = 1;
@@ -82,32 +138,38 @@ void speaker_init() {
     MI_AO_SetPubAttr(audio.aoDevId, &aoAttr);
     MI_AO_Enable(audio.aoDevId);
     MI_AO_EnableChn(audio.aoDevId, audio.aoChn);
-    MI_AO_SetVolume(audio.aoDevId, 0);
-    setup_gpio(14, "out", 1);
+    MI_AO_SetVolume(audio.aoDevId, -30);
 
-    pthread_t threadId;
+    pthread_t threadAudio, threadMP3Decoder;
     pthread_attr_t attr;
     struct sched_param param;
 
     // 初始化线程属性
     pthread_attr_init(&attr);
-
-    // 设置线程继承属性为显式
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-
-    // 设置调度策略为先进先出
     pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
 
-    // 设置线程优先级
+    // 设置音频线程优先级最高
     param.sched_priority = sched_get_priority_max(SCHED_FIFO);
     pthread_attr_setschedparam(&attr, &param);
+    pthread_create(&threadAudio, &attr, audioPlayThread, &audio);
 
-    // 创建线程
-    pthread_create(&threadId, &attr, audioPlayThread, &audio);
+    // 设置MP3解码线程优先级稍低
+    param.sched_priority -= 1; // 确保比音频线程优先级低
+    pthread_attr_setschedparam(&attr, &param);
+    pthread_create(&threadMP3Decoder, &attr, mp3Decoder, NULL);
+
+    // pthread_join(threadAudio, NULL);
+    // pthread_join(threadMP3Decoder, NULL);
+
+    // pthread_attr_destroy(&attr); // 清理线程属性对象
 }
 
 void audio_start(char *file_path) {
-    free(audio.FilePath);  // 释放之前的路径内存
+    if (audio.FilePath != NULL) {
+        free(audio.FilePath);  // 如果有，先释放旧内存
+        audio.FilePath = NULL;
+    }
     audio.FilePath = strdup(file_path);  // 复制并存储新路径
     audio.hasNewAudio = 1;
 }
@@ -118,57 +180,73 @@ void audio_volumeSet(int volume)
         return;
     MI_AO_SetVolume(audio.aoDevId, volume);
 }
-
-void setup_gpio(int gpio, const char *direction, int value) {
-    int fd;
-    char buf[50];
-
-    // 检查GPIO是否已经导出
-    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", gpio);
-    fd = open(buf, O_WRONLY);
-    if (fd == -1) {
-        // 如果未导出，则导出GPIO
-        fd = open("/sys/class/gpio/export", O_WRONLY);
-        if (fd == -1) {
-            perror("Unable to open /sys/class/gpio/export");
-            exit(1);
+void mp3Decoder()
+{
+    memset(&AudioMP3State, 0, sizeof(AudioMP3State_t));
+    while(1)
+    {
+        if(AudioMP3State.hasNewMP3)
+        {
+            AudioMP3State.hasNewMP3 = 0;
+            // 清缓存
+            AudioMP3State.Head = 0;
+            AudioMP3State.Tail = 0;
+            AudioMP3State.Num = 0; 
+            AudioMP3State.playState = 1;
+            Initialize_MP3Decoder(AudioMP3State.FilePath, mp3_frameDataProcess); // 函数执行完毕即解码完成
+            AudioMP3State.playState = 0;
         }
-        snprintf(buf, sizeof(buf), "%d", gpio);
-        if (write(fd, buf, strlen(buf)) != strlen(buf)) {
-            perror("Error writing to /sys/class/gpio/export");
-            exit(1);
-        }
-        close(fd);
-        // 需要稍微延时一下确保文件系统已更新
-        usleep(100000);
+        usleep(100 * 1000);
+    }
+}
 
-        // 再次尝试打开方向文件
-        snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", gpio);
-        fd = open(buf, O_WRONLY);
-        if (fd == -1) {
-            perror("Unable to open gpio direction file after export");
-            exit(1);
-        }
+int mp3_frameDataProcess(uint16_t *data, int length, int frq, int channels)
+{
+    // MP3解码默认16bit,传入音频默认8bit,长度*2
+    while(AudioMP3State.Num >= MAX_FRAMES && AudioMP3State.hasNewMP3 == 0){
+        usleep(20000);
     }
+    if(AudioMP3State.hasNewMP3)
+        return -1;
+    if(length > SAMPLE_PER_FRAME)
+    {
+        LOG_E(TAG, "mp3 frame data length error:%d\n", length);
+        return;
+    }
+    memcpy(AudioMP3State.frame[AudioMP3State.Tail].buf, data, length * 2);
+    AudioMP3State.frame[AudioMP3State.Tail].length = length * 2;
+    AudioMP3State.frame[AudioMP3State.Tail].frq = frq;
+    AudioMP3State.frame[AudioMP3State.Tail].channels = channels;
+    AudioMP3State.Tail = (AudioMP3State.Tail + 1) % MAX_FRAMES;
+    AudioMP3State.Num++;
+}
 
-    // 设置GPIO方向
-    if (write(fd, direction, strlen(direction)) != strlen(direction)) {
-        perror("Error writing to gpio direction file");
-        exit(1);
-    }
-    close(fd);
+int mp3_frameDataRead(uint8_t *data, int *length, int *frq, int *channels)
+{
+    // LOG_I(TAG, "Frame Num:%d\n", AudioMP3State.Num);
+    if(AudioMP3State.Num <= 0)
+        return -1;
+    memcpy(data, AudioMP3State.frame[AudioMP3State.Head].buf, AudioMP3State.frame[AudioMP3State.Head].length);
+    *length = AudioMP3State.frame[AudioMP3State.Head].length;
+    *frq = AudioMP3State.frame[AudioMP3State.Head].frq;
+    *channels = AudioMP3State.frame[AudioMP3State.Head].channels;
+    AudioMP3State.Head = (AudioMP3State.Head + 1) % MAX_FRAMES;
+    AudioMP3State.Num--;
+    return 1;
+}
 
-    // 设置GPIO值
-    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/value", gpio);
-    fd = open(buf, O_WRONLY);
-    if (fd == -1) {
-        perror("Unable to open gpio value file");
-        exit(1);
+void audio_mp3Init(const char *file_path)
+{
+    LOG_I(TAG, "mp3 decoder init\n");
+    if (AudioMP3State.FilePath != NULL) {
+        free(AudioMP3State.FilePath);  // 如果有，先释放旧内存
+        AudioMP3State.FilePath = NULL;
     }
-    snprintf(buf, sizeof(buf), "%d", value);
-    if (write(fd, buf, strlen(buf)) != strlen(buf)) {
-        perror("Error writing to gpio value file");
-        exit(1);
-    }
-    close(fd);
+    AudioMP3State.FilePath = strdup(file_path);
+    AudioMP3State.hasNewMP3 = 1;
+}
+
+void audio_mp3SetPlayState(uint8_t state)
+{
+    AudioMP3State.playState = state;
 }

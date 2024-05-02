@@ -1,0 +1,53 @@
+void setup_gpio(int gpio, const char *direction, int value) {
+    int fd;
+    char buf[50];
+
+    // 检查GPIO是否已经导出
+    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", gpio);
+    fd = open(buf, O_WRONLY);
+    if (fd == -1) {
+        // 如果未导出，则导出GPIO
+        fd = open("/sys/class/gpio/export", O_WRONLY);
+        if (fd == -1) {
+            perror("Unable to open /sys/class/gpio/export");
+            exit(1);
+        }
+        snprintf(buf, sizeof(buf), "%d", gpio);
+        if (write(fd, buf, strlen(buf)) != strlen(buf)) {
+            perror("Error writing to /sys/class/gpio/export");
+            exit(1);
+        }
+        close(fd);
+        // 需要稍微延时一下确保文件系统已更新
+        usleep(100000);
+
+        // 再次尝试打开方向文件
+        snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/direction", gpio);
+        fd = open(buf, O_WRONLY);
+        if (fd == -1) {
+            perror("Unable to open gpio direction file after export");
+            exit(1);
+        }
+    }
+
+    // 设置GPIO方向
+    if (write(fd, direction, strlen(direction)) != strlen(direction)) {
+        perror("Error writing to gpio direction file");
+        exit(1);
+    }
+    close(fd);
+
+    // 设置GPIO值
+    snprintf(buf, sizeof(buf), "/sys/class/gpio/gpio%d/value", gpio);
+    fd = open(buf, O_WRONLY);
+    if (fd == -1) {
+        perror("Unable to open gpio value file");
+        exit(1);
+    }
+    snprintf(buf, sizeof(buf), "%d", value);
+    if (write(fd, buf, strlen(buf)) != strlen(buf)) {
+        perror("Error writing to gpio value file");
+        exit(1);
+    }
+    close(fd);
+}

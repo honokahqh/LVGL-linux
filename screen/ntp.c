@@ -11,9 +11,9 @@ void *syn_ntp_time(void) {
         for (int i = 0; i < num_servers && keepRunning; i++) {
             char command[256];
             snprintf(command, sizeof(command), "sntp -s %s", servers[i]);
-            // if (system(command) == 0) {
-            //     break; // 假设如果命令执行成功，则退出循环
-            // }
+            if (system(command) == 0) {
+                break; // 假设如果命令执行成功，则退出循环
+            }
         }
         for(int i = 0; i < 3600 && keepRunning; i++) {
             sleep(1); // 睡眠，但每秒检查一次是否应该停止

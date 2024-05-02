@@ -1,12 +1,12 @@
 # 项目名称
 
-此项目基于硬件平台SSD202，并使用U-Boot和Linux Kernel 4.9.84，以及Buildroot作为软件平台。它采用LVGL作为GUI库，使用SquareLine作为GUI设计工具。
+此项目基于硬件平台SSD202，并使用U-Boot和Linux Kernel 4.9.84，以及Buildroot作为软件平台。使用LVGL作为GUI库，SquareLine作为GUI设计工具。
 
 ## 硬件平台
 
 - **平台型号**：SSD202
 
-## 核心参数
+## 基本参数
 
 - 双核CortexA7 1.2GHz  
 - 128MB DDR2  
@@ -30,7 +30,7 @@
 
 1. 使用SquareLine设计GUI界面。
 2. 将设计导出生成代码。
-3. 生成的代码会被放置在`generate`文件夹内。
+3. 生成的代码cp到`generate`文件夹内。
 
 ## 如何使用
 
@@ -54,5 +54,12 @@
    ```bash
    ls ./build/bin/
 
+### buildroot改动
+1. 使能overlay
+2. curl库 用于https通讯
+3. libmad 用于MP3解码
+4. 
+### SDK改动
+1. 由i2m/rootfs + disp_init/run.sh生成demo.sh,更改run.sh,上电初始化io,执行lvgl
 ### LVGL源码改动
-1. evdev.c click事件 audio_start("/honoka/audio/pizzicato.wav");
+1. evdev.c click事件触发时调用api播放click.wav
